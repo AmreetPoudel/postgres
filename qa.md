@@ -145,9 +145,50 @@
 
 ---
 
+**Q11: What is the fundamental difference between PostgreSQL's Private Memory and Shared Memory?**
+
+> **Answer**:
+> - **Shared Memory**: Allocated once by Postmaster during server startup using OS shared memory (POSIX/SysV). Accessible by ALL backend processes and background workers simultaneously. Contains `shared_buffers` (cached 8KB table/index pages), the Lock Table (concurrency control), and WAL buffers.
+> - **Private Memory**: Allocated dynamically by each individual backend process for its own session/query. Completely isolated from all other processes; when the backend exits or disconnects, the OS automatically reclaims 100% of it. Contains query parse trees, execution plans, and `work_mem` (used for sorting and hashing).
+>
+> **The Production Gotcha**: If a query has 3 sort nodes and runs with `work_mem = 64MB`, a single backend process can consume `3 × 64MB = 192MB` of private RAM. With 100 concurrent connections doing that, the server needs ~19GB of RAM *just for private memory*, which can trigger the OS OOM (Out Of Memory) Killer to kill PostgreSQL.
+
+---
+
+**Q12: Does PostgreSQL ever process query data directly on disk, or always through memory? What is a Cache Hit vs Cache Miss?**
+
+> **Answer**:
+> In standard query execution, **PostgreSQL ALWAYS serves data from memory (`shared_buffers`)**. The CPU cannot execute SQL operations or filter rows directly on disk blocks.
+>
+> - **Cache Hit**: The requested 8KB page is already sitting in one of the 8KB slots in `shared_buffers`. The backend reads it directly from RAM in nanoseconds/microseconds without touching the disk.
+> - **Cache Miss**: The requested 8KB page is not in `shared_buffers`. PostgreSQL must issue a read call to load that 8KB page from the storage drive into a slot in `shared_buffers` first, and only then serves the rows to the client.
+>
+> *(Exception: Massive table scans or `VACUUM` use a tiny temporary "ring buffer" of 256KB-16MB to avoid blowing away the main cache, but it still loads 8KB pages into RAM before reading).*
+>
+> **Production Benchmark Metric**: In production OLTP environments, you monitor the **Buffer Cache Hit Ratio** via `pg_statio_user_tables`:
+> `sum(heap_blks_hit) / (sum(heap_blks_hit) + sum(heap_blks_read)) * 100%`
+> In a healthy production database, this should consistently stay above **99%**. If it dips below 95%, your disk I/O spikes and query latency degrades.
+
+---
+
+**Q13: What is a "dirty page" in PostgreSQL? How does it differ from a "clean page"?**
+
+> **Answer**:
+> - **Clean Page**: An 8KB page in `shared_buffers` whose content is identical bit-for-bit to the data file on the SSD. If PostgreSQL needs room for new data, it can evict a clean page instantly without doing any disk write.
+> - **Dirty Page**: An 8KB page in `shared_buffers` that has been modified by an `INSERT`, `UPDATE`, or `DELETE`, but has **not yet been written to the table file on disk**.
+>
+> **Lifecycle of a Dirty Page**:
+> 1. A backend process modifies rows inside the 8KB page in `shared_buffers` and marks the page's dirty flag as `true`.
+> 2. The backend writes the transaction's changes to the WAL buffer and commits.
+> 3. The page remains "dirty" in RAM until the **Checkpointer** or **Background Writer (bgwriter)** sweeps through, writes the 8KB page to the SSD, and clears the dirty flag back to `false` (making it clean again).
+>
+> **DBA Implication**: You can observe the volume of dirty buffers via the `pg_buffercache` extension. A massive surge in dirty pages means high upcoming write pressure on the storage subsystem during the next checkpoint.
+
+---
+
 ## Storage
 
-**Q11: Where on disk does PostgreSQL store a table's data? Walk through the path.**
+**Q14: Where on disk does PostgreSQL store a table's data? Walk through the path.**
 
 > **Answer**: Every object in PostgreSQL has an OID (Object Identifier). Tables are stored at:
 > `$PGDATA/base/<database_oid>/<table_relfilenode>`
@@ -167,7 +208,7 @@
 
 ---
 
-**Q12: What is an 8KB page in PostgreSQL?**
+**Q15: What is an 8KB page in PostgreSQL?**
 
 > **Answer**: PostgreSQL reads and writes data in fixed-size blocks called **pages** (8KB by default). Every table file is a sequence of pages. The page layout:
 > - **Page header** (24 bytes): LSN of last WAL record touching this page, checksum, free space info
@@ -181,7 +222,7 @@
 
 ## WAL
 
-**Q13: What is WAL and what problem does it solve?**
+**Q16: What is WAL and what problem does it solve?**
 
 > **Answer**: WAL = Write-Ahead Log. It's a sequential log of every change to the database, stored in `$PGDATA/pg_wal/`.
 >
@@ -196,7 +237,7 @@
 
 ---
 
-**Q14: What happens if you delete `pg_wal/` while PostgreSQL is running?**
+**Q17: What happens if you delete `pg_wal/` while PostgreSQL is running?**
 
 > **Answer**: Much worse than "losing a few commits":
 > 1. PostgreSQL panics immediately with `PANIC: could not write to file "pg_wal/..."` and crashes
@@ -208,7 +249,7 @@
 
 ---
 
-**Q15: What is an LSN (Log Sequence Number)?**
+**Q18: What is an LSN (Log Sequence Number)?**
 
 > **Answer**: An LSN is a 64-bit pointer into the WAL stream, written as `X/XXXXXXXX` (e.g., `0/15D3A00`). It represents a byte offset within the WAL.
 >
@@ -225,7 +266,7 @@
 
 ---
 
-**Q16: What are WAL segments? How are they named?**
+**Q19: What are WAL segments? How are they named?**
 
 > **Answer**: WAL is stored in 16MB files called **segments** in `pg_wal/`. The filename is 24 hex characters encoding three 8-character fields:
 >
@@ -242,7 +283,7 @@
 
 ## MVCC
 
-**Q17: What does MVCC stand for and why does PostgreSQL use it?**
+**Q20: What does MVCC stand for and why does PostgreSQL use it?**
 
 > **Answer**: **Multi-Version Concurrency Control**.
 >
@@ -254,7 +295,7 @@
 
 ---
 
-**Q18: What are `xmin` and `xmax` on a PostgreSQL row?**
+**Q21: What are `xmin` and `xmax` on a PostgreSQL row?**
 
 > **Answer**: Every row (tuple) in PostgreSQL carries two hidden fields:
 > - `xmin`: Transaction ID that **created** this row version (INSERT or UPDATE that created it)
@@ -273,7 +314,7 @@
 
 ---
 
-**Q19: You UPDATE 1 million rows. How many row versions exist immediately after?**
+**Q22: You UPDATE 1 million rows. How many row versions exist immediately after?**
 
 > **Answer**: **2 million** — one old version (xmax set, marked deleted) and one new version (xmin set) for each of the 1 million rows. Both physically exist on disk until VACUUM cleans the old versions.
 >
@@ -283,7 +324,7 @@
 
 ## VACUUM & Bloat
 
-**Q20: What is table bloat and what causes it?**
+**Q23: What is table bloat and what causes it?**
 
 > **Answer**: Bloat = table file size is much larger than the actual live data.
 >
@@ -297,7 +338,7 @@
 
 ---
 
-**Q21: What happens if VACUUM never runs?**
+**Q24: What happens if VACUUM never runs?**
 
 > **Answer**: Three cascading problems:
 > 1. **Bloat**: Table files grow without bound. Queries scan more pages, get slower.
@@ -310,7 +351,7 @@
 
 ## Query Planning & Execution
 
-**Q22: What are the 6 stages of a PostgreSQL query?**
+**Q25: What are the 6 stages of a PostgreSQL query?**
 
 > **Answer**:
 > 1. **Parser**: Tokenizes and parses SQL into an Abstract Syntax Tree. Syntax errors caught here.
@@ -322,7 +363,7 @@
 
 ---
 
-**Q23: A query ran in 5ms yesterday. Same query runs in 8 seconds today. Data hasn't changed. What's your first suspect?**
+**Q26: A query ran in 5ms yesterday. Same query runs in 8 seconds today. Data hasn't changed. What's your first suspect?**
 
 > **Answer**: **Stale statistics → bad query plan**.
 >
@@ -345,7 +386,7 @@
 
 ---
 
-**Q24: What does `EXPLAIN (ANALYZE, BUFFERS)` show and why does it matter?**
+**Q27: What does `EXPLAIN (ANALYZE, BUFFERS)` show and why does it matter?**
 
 > **Answer**:
 > - **EXPLAIN**: Shows the plan the planner *would* use (estimates only, query NOT executed)
@@ -362,7 +403,7 @@
 
 ## The Three Resource Bottlenecks
 
-**Q25: What are the three ways PostgreSQL performance degrades, and how do you identify each?**
+**Q28: What are the three ways PostgreSQL performance degrades, and how do you identify each?**
 
 > **Answer**:
 >
@@ -452,5 +493,5 @@
 ---
 
 *Last updated: 2026-09-15 — Session 001*
-*Questions: 25 | Target: 200+*
+*Questions: 28 | Target: 200+*
 *Topics covered: Architecture, Process Model, Memory, Storage, WAL, MVCC, VACUUM & Bloat, Query Planning, Resource Bottlenecks*
