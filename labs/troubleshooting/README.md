@@ -4,6 +4,12 @@ Real production scenarios. Each lab has: the symptom, why it happens, how to dia
 
 Do these AFTER completing the main curriculum. They assume you understand the internals.
 
+**Paths and commands** assume a RHEL-style or source install, where everything lives in `$PGDATA`. On Debian/Ubuntu:
+- Config files are in `/etc/postgresql/16/main/` (`SHOW config_file;` and `SHOW hba_file;` tell you)
+- Logs are in `/var/log/postgresql/postgresql-16-main.log` (`SHOW log_directory;`)
+- `pg_ctl` isn't on your PATH: use `pg_ctlcluster 16 main reload|restart` or `systemctl`
+- Run the commands as the `postgres` OS user unless a step says otherwise
+
 ---
 
 ## By Severity

@@ -20,11 +20,19 @@ kernel: Killed process 12345 (postgres) total-vm:16GB, anon-rss:14GB
 
 Total memory used by PostgreSQL > available RAM:
 ```
-shared_buffers + (work_mem × max_connections × sort_nodes) + OS page cache
-  + OS overhead > Physical RAM
+shared_buffers + (work_mem × active queries × sort/hash nodes) + per-connection overhead
+  + maintenance_work_mem × autovacuum workers + OS overhead > RAM
 ```
+(The OS page cache isn't part of the sum: the kernel can always reclaim it.)
 
 Linux OOM killer picks the process using most memory and kills it.
+
+It hardly matters *which* PostgreSQL process it picks. A backend killed with SIGKILL counts as a crash, so the postmaster terminates every other session and runs crash recovery: one killed backend is a full, if brief, outage. If the OOM killer picks the postmaster itself, PostgreSQL stays down until someone restarts it.
+
+```
+LOG:  server process (PID 12345) was terminated by signal 9: Killed
+LOG:  terminating any other active server processes
+```
 
 ---
 
@@ -56,15 +64,18 @@ psql -c "SELECT
 shared_buffers         = 8GB    # not more than 25% of RAM
 work_mem               = 16MB   # keep low, set high per-session for analytics
 max_connections        = 100    # reduce, use PgBouncer
-
-# OS — prevent OOM by reserving swap and setting limits
-vm.swappiness          = 10
 ```
 
+**Stop the kernel from overcommitting** (2.7): with `vm.overcommit_memory = 2`, a query that asks for too much memory gets an `out of memory` error in its own session, instead of the OOM killer taking the whole server down. That's what the PostgreSQL documentation recommends for a dedicated server.
+
+**If you keep overcommit on, at least protect the postmaster**, persistently, through systemd. The `PG_OOM_ADJUST_*` variables (described in the PostgreSQL docs on Linux memory overcommit) make each child process reset its own score, so a runaway backend is still the one that gets killed. RHEL's PGDG unit file already ships these lines:
 ```bash
-# Protect PostgreSQL from OOM killer (lower score = less likely to be killed)
-PG_PID=$(pgrep -f "postgres: checkpointer")
-echo -100 > /proc/$PG_PID/oom_score_adj
+systemctl edit postgresql@16-main      # RHEL/Rocky: systemctl edit postgresql-16
+# then add:
+#   [Service]
+#   OOMScoreAdjust=-1000
+#   Environment=PG_OOM_ADJUST_FILE=/proc/self/oom_score_adj
+#   Environment=PG_OOM_ADJUST_VALUE=0
 ```
 
 ---
@@ -84,20 +95,22 @@ SELECT
 ```
 
 ```bash
-# Check actual PostgreSQL memory usage
-PG_PID=$(pgrep -o -f "postgres: checkpointer" 2>/dev/null || echo "not found")
-echo "Postmaster PID: $(pgrep -o postgres)"
-cat /proc/$(pgrep -o postgres)/status | grep -E "VmRSS|VmPeak|VmSize"
+# Check actual PostgreSQL memory usage. The postmaster's PID is the first line of
+# postmaster.pid. (RSS includes the shared memory a process has touched, so adding
+# up RSS across backends counts shared_buffers many times over.)
+PG_PID=$(head -1 "$PGDATA/postmaster.pid")
+grep -E "VmRSS|VmPeak|VmSize" /proc/$PG_PID/status
 ```
 
 ```bash
 # Check OOM score
-PG_PID=$(pgrep -o postgres)
+PG_PID=$(head -1 "$PGDATA/postmaster.pid")
 cat /proc/$PG_PID/oom_score
 # Lower score = less likely to be killed
 # Default: ~500-900 for a large process
 
-# Protect PostgreSQL
+# Protect the postmaster, for this boot only (processes it forks from now on
+# inherit the value, which is why the systemd setup above resets the children)
 echo -100 | sudo tee /proc/$PG_PID/oom_score_adj
 cat /proc/$PG_PID/oom_score   # should be lower now
 ```

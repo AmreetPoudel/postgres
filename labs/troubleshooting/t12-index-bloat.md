@@ -14,34 +14,26 @@ Table is 10GB. Its indexes are 40GB. Queries using indexes are slow despite good
 
 ## Why This Happens
 
-VACUUM cleans dead tuples in heap pages and marks dead index entries as reusable. But deleted index entries are not immediately reclaimed — only removed when a page becomes entirely dead. On a table with heavy random updates, index pages become sparse (many dead pointers, few live ones).
+VACUUM removes dead index entries, but the space they free can only be reused by new keys that sort into the *same* page, and a page is only handed back for reuse once it's completely empty. On a table with heavy random updates, index pages end up half empty: the index grows, and every index scan reads more pages than it needs. (B-tree deduplication in PG13 and bottom-up deletion in PG14 reduce this a lot, but not to zero.)
 
 ---
 
 ## Diagnosis
 
 ```sql
--- Index bloat estimation
-SELECT
-    t.tablename,
-    i.indexname,
-    pg_size_pretty(pg_relation_size(i.indexrelid)) AS index_size,
-    pg_size_pretty(pg_relation_size(t.tableid))    AS table_size,
-    idx_scan,
-    idx_tup_read,
-    idx_tup_fetch
-FROM pg_tables t
-JOIN pg_indexes i    ON i.tablename = t.tablename
-JOIN pg_stat_user_indexes ui ON ui.indexrelname = i.indexname
-JOIN pg_index pi ON pi.indexrelid = ui.indexrelid
-WHERE t.schemaname = 'public'
-ORDER BY pg_relation_size(i.indexrelid) DESC LIMIT 10;
+-- Biggest indexes next to their tables (a large index-to-table ratio is a hint)
+SELECT schemaname, relname AS table_name, indexrelname AS index_name, idx_scan,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+       pg_size_pretty(pg_relation_size(relid))      AS table_size
+FROM pg_stat_user_indexes
+ORDER BY pg_relation_size(indexrelid) DESC LIMIT 10;
 
--- pgstattuple extension (more accurate bloat estimate)
+-- Measure it properly with pgstatindex() from the pgstattuple extension (B-tree)
 CREATE EXTENSION IF NOT EXISTS pgstattuple;
-SELECT * FROM pgstattuple('orders_pkey');
--- Look at: dead_tuple_percent, free_percent
--- dead_tuple_percent > 20% → significant bloat
+SELECT avg_leaf_density, leaf_fragmentation FROM pgstatindex('orders_pkey');
+-- A freshly built index (CREATE INDEX or REINDEX) sits near 90% leaf density, its
+-- fillfactor; one grown by random inserts typically settles around 60-70%.
+-- Well below 50% means a REINDEX would shrink it a lot.
 ```
 
 ---
@@ -75,19 +67,20 @@ SELECT (random()*1000000)::int FROM generate_series(1, 300000);
 
 -- Baseline
 SELECT pg_size_pretty(pg_relation_size('idx_bloat_lab_val_idx')) AS before_size;
-SELECT dead_tuple_percent, free_percent
-FROM pgstattuple('idx_bloat_lab_val_idx');
+SELECT avg_leaf_density, leaf_fragmentation FROM pgstatindex('idx_bloat_lab_val_idx');
 ```
 
 ```sql
 -- Create index bloat: update all val entries repeatedly
 UPDATE idx_bloat_lab SET val = (random()*1000000)::int;
 UPDATE idx_bloat_lab SET val = (random()*1000000)::int;
-VACUUM idx_bloat_lab;  -- cleans heap but not all index bloat
+VACUUM idx_bloat_lab;  -- removes the dead entries, but the index stays big and half empty
 
 -- Measure bloat
 SELECT pg_size_pretty(pg_relation_size('idx_bloat_lab_val_idx')) AS bloated_size;
-SELECT dead_tuple_percent, free_percent FROM pgstattuple('idx_bloat_lab_val_idx');
+SELECT avg_leaf_density, leaf_fragmentation FROM pgstatindex('idx_bloat_lab_val_idx');
+-- (pgstattuple's dead_tuple_percent reads ~0 here: VACUUM removed the dead entries.
+--  The bloat is free space, which is what leaf density shows.)
 ```
 
 ```sql
@@ -96,10 +89,10 @@ REINDEX INDEX CONCURRENTLY idx_bloat_lab_val_idx;
 
 -- Measure after
 SELECT pg_size_pretty(pg_relation_size('idx_bloat_lab_val_idx')) AS after_size;
-SELECT dead_tuple_percent, free_percent FROM pgstattuple('idx_bloat_lab_val_idx');
+SELECT avg_leaf_density, leaf_fragmentation FROM pgstatindex('idx_bloat_lab_val_idx');
 
 DROP TABLE idx_bloat_lab;
 ```
 
 **Write down**: Index size before bloat: ___ after bloat: ___ after REINDEX: ___  
-dead_tuple_percent before fix: ___
+avg_leaf_density before and after REINDEX: ___

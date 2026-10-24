@@ -36,7 +36,7 @@ Replace IP addresses below with your actual server IPs.
 ```
 
 ```sql
--- Edit postgresql.conf
+-- ALTER SYSTEM writes these into postgresql.auto.conf
 ALTER SYSTEM SET wal_level           = 'replica';
 ALTER SYSTEM SET max_wal_senders     = 5;
 ALTER SYSTEM SET wal_keep_size       = '1GB';
@@ -54,13 +54,16 @@ pg_ctl restart -D "$PGDATA" -m fast
 CREATE USER replicator WITH REPLICATION ENCRYPTED PASSWORD 'ReplPass123!';
 
 -- Verify
-SELECT usename, replication FROM pg_user WHERE usename = 'replicator';
+SELECT rolname, rolreplication FROM pg_roles WHERE rolname = 'replicator';
 ```
 
 ```bash
-# Add standby to pg_hba.conf (replace STANDBY_IP)
-echo "host replication replicator STANDBY_IP/32 scram-sha-256" >> "$PGDATA/pg_hba.conf"
-pg_ctl reload -D "$PGDATA"
+# Add standby to pg_hba.conf (replace STANDBY_IP). Ask PostgreSQL where the file is:
+# on Debian/Ubuntu it's /etc/postgresql/16/main/pg_hba.conf, not in $PGDATA.
+# If your pg_hba.conf ends with a reject-all rule, put this line ABOVE it instead.
+HBA=$(psql -U postgres -tAc "SHOW hba_file;")
+echo "host replication replicator STANDBY_IP/32 scram-sha-256" >> "$HBA"
+psql -U postgres -c "SELECT pg_reload_conf();"
 ```
 
 ---
@@ -72,8 +75,9 @@ pg_ctl reload -D "$PGDATA"
 # Stop any existing PostgreSQL
 pg_ctl stop -D "$PGDATA" -m fast 2>/dev/null || true
 
-# Clear data directory (pg_basebackup requires empty target)
-rm -rf "$PGDATA"/*
+# Clear data directory (pg_basebackup requires an empty target).
+# ${PGDATA:?} aborts if PGDATA is unset, so this can never turn into rm -rf /*
+rm -rf "${PGDATA:?}"/*
 
 # Take base backup from primary
 # -R flag: writes standby.signal + primary_conninfo automatically
@@ -102,7 +106,7 @@ grep primary_conninfo "$PGDATA/postgresql.auto.conf"
 # On STANDBY server
 pg_ctl start -D "$PGDATA"
 
-# Watch logs for "started streaming"
+# Watch logs for "started streaming" (Debian/Ubuntu: /var/log/postgresql/postgresql-16-main.log)
 tail -20 "$PGDATA"/log/postgresql-*.log | grep -i -E "stream|recovery|standby"
 ```
 
@@ -110,8 +114,8 @@ tail -20 "$PGDATA"/log/postgresql-*.log | grep -i -E "stream|recovery|standby"
 -- Verify standby is in recovery mode
 SELECT pg_is_in_recovery();          -- must return: true
 
--- Check lag from primary
-SELECT now() - pg_last_xact_replay_timestamp() AS lag_from_primary;
+-- Time since the last replayed transaction (it grows on an idle primary even with zero lag)
+SELECT now() - pg_last_xact_replay_timestamp() AS since_last_replay;
 ```
 
 ---
@@ -126,7 +130,7 @@ SELECT
     application_name,
     client_addr,
     state,
-    pg_wal_lsn_diff(sent_lsn, replay_lsn) AS lag_bytes,
+    pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS lag_bytes,
     replay_lag,
     sync_state
 FROM pg_stat_replication;
@@ -160,16 +164,17 @@ INSERT INTO repl_test (msg) VALUES ('standby write');
 
 ```sql
 -- On PRIMARY: create a named physical slot for the standby
-SELECT pg_create_physical_replication_slot('standby_slot');
+SELECT pg_create_physical_replication_slot('standby_slot', true);   -- true = reserve WAL now
 
 -- Verify it was created
 SELECT slot_name, slot_type, active, restart_lsn FROM pg_replication_slots;
 ```
 
 ```bash
-# On STANDBY: tell it to use the slot
-echo "primary_slot_name = 'standby_slot'" >> "$PGDATA/postgresql.auto.conf"
-pg_ctl restart -D "$PGDATA" -m fast
+# On STANDBY: tell it to use the slot. ALTER SYSTEM works on a standby too
+# (don't edit postgresql.auto.conf by hand), and since PG13 a reload is enough.
+psql -U postgres -c "ALTER SYSTEM SET primary_slot_name = 'standby_slot';"
+psql -U postgres -c "SELECT pg_reload_conf();"
 ```
 
 ```sql
@@ -189,7 +194,7 @@ FROM pg_replication_slots;
 ```bash
 # Step 1: Stop primary (simulate crash)
 # On PRIMARY:
-pg_ctl stop -D "$PGDATA" -m immediate   # kills it like kill -9
+pg_ctl stop -D "$PGDATA" -m immediate   # no shutdown checkpoint: like a crash
 
 # Step 2: Promote standby to primary
 # On STANDBY:
@@ -207,15 +212,26 @@ Record: How many seconds did promotion take? _____
 ### Rebuild old primary as standby:
 
 ```bash
-# On OLD PRIMARY server:
-pg_ctl stop -D "$PGDATA" -m fast 2>/dev/null || true
-rm -rf "$PGDATA"/*
+# On the NEW PRIMARY (the old standby) first: let the old primary connect for replication.
+# Its pg_hba.conf has a rule for STANDBY_IP (or no rule at all on Debian, where the file
+# lives outside PGDATA), but none for PRIMARY_IP. Put it above any reject-all line.
+HBA=$(psql -U postgres -tAc "SHOW hba_file;")
+echo "host replication replicator PRIMARY_IP/32 scram-sha-256" >> "$HBA"
+psql -U postgres -c "SELECT pg_reload_conf();"
+```
 
+```bash
+# On OLD PRIMARY server (STANDBY_IP = the old standby, now the primary):
+pg_ctl stop -D "$PGDATA" -m fast 2>/dev/null || true
+rm -rf "${PGDATA:?}"/*
+
+# -C -S creates a replication slot on the new primary; -R records it in the config
 pg_basebackup \
-    -h STANDBY_IP \      # old standby is now new primary
+    -h STANDBY_IP \
     -U replicator \
     -W \
     -D "$PGDATA" \
+    -C -S old_primary_slot \
     -R -X stream --checkpoint=fast -P -v
 
 pg_ctl start -D "$PGDATA"

@@ -14,7 +14,7 @@ Latency graph shows regular spikes every 5 minutes. System is slow for 10-30 sec
 
 ## Why This Happens
 
-Default `checkpoint_timeout = 5min`. Every 5 minutes, all dirty pages flush at once = I/O burst.
+Default `checkpoint_timeout = 5min`, and on a busy server the default `max_wal_size = 1GB` forces checkpoints even more often. The writes themselves are spread out (`checkpoint_completion_target = 0.9`), but every checkpoint still causes two bursts: the fsync of everything written, at the end, and a flood of full-page images in WAL right after it starts (the first change to every page after a checkpoint logs the whole 8KB page).
 
 ---
 
@@ -27,15 +27,20 @@ SELECT checkpoints_timed,
            AS pct_forced,
        checkpoint_write_time/1000.0 AS write_sec,
        buffers_checkpoint,
-       buffers_backend         -- nonzero = backends flushing own pages (bad)
+       buffers_backend         -- a large share = backends flushing their own pages
 FROM pg_stat_bgwriter;
 
 -- checkpoints_req >> checkpoints_timed → increase max_wal_size
--- buffers_backend > 0 → checkpoints can't keep up with write rate
+-- buffers_backend a large share of writes → bgwriter can't keep clean buffers ready
+
+-- Full-page images: lots of them = checkpoints are frequent (PG14+)
+SELECT wal_records, wal_fpi FROM pg_stat_wal;
 ```
 
 ```bash
 grep "checkpoint" "$PGDATA"/log/postgresql-*.log | tail -10
+# Look for "checkpoints are occurring too frequently" and long sync= times
+# (Debian/Ubuntu: /var/log/postgresql/postgresql-16-main.log)
 ```
 
 ---
@@ -64,37 +69,28 @@ SELECT pg_reload_conf();
 -- Reset stats
 SELECT pg_stat_reset_shared('bgwriter');
 
--- Generate WAL to trigger checkpoints
-DO $$
-BEGIN
-    FOR i IN 1..20 LOOP
-        EXECUTE 'CREATE TABLE IF NOT EXISTS chk_test_' || i || ' AS
-            SELECT md5(j::text) FROM generate_series(1,5000) j';
-    END LOOP;
-END;
-$$;
+-- Generate ~250MB of WAL (about 4× max_wal_size) to force requested checkpoints.
+-- (Twenty 5,000-row tables would write only ~9MB: not enough to trigger anything.)
+CREATE TABLE chk_test AS
+SELECT md5(j::text) AS v FROM generate_series(1, 3000000) j;
 
 -- Check checkpoint stats
 SELECT checkpoints_timed, checkpoints_req,
        round(checkpoints_req::numeric/nullif(checkpoints_timed+checkpoints_req,0)*100,1) AS pct_forced
 FROM pg_stat_bgwriter;
 
--- View checkpoint log entries
+-- View checkpoint log entries: you should see "checkpoints are occurring too frequently"
 -- grep "checkpoint" "$PGDATA"/log/postgresql-*.log | tail -10
 ```
 
 ```sql
--- Restore sane settings
-ALTER SYSTEM SET checkpoint_timeout = '30min';
-ALTER SYSTEM SET max_wal_size = '4GB';
+-- Put back whatever you had before the lab
+ALTER SYSTEM RESET checkpoint_timeout;
+ALTER SYSTEM RESET max_wal_size;
 SELECT pg_reload_conf();
 
 -- Cleanup
-DO $$ BEGIN
-    FOR i IN 1..20 LOOP
-        EXECUTE 'DROP TABLE IF EXISTS chk_test_' || i;
-    END LOOP;
-END; $$;
+DROP TABLE chk_test;
 ```
 
 **Write down**: How many checkpoints_req vs checkpoints_timed? ___  

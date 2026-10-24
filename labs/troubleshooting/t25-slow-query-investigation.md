@@ -97,9 +97,14 @@ CREATE INDEX CONCURRENTLY idx_name ON table_name(column_name);
 SET work_mem = '256MB';
 -- (Investigate if a global increase is warranted)
 
--- Fix D: Blocking transaction
-SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-WHERE wait_event_type = 'Lock' AND pid != pg_backend_pid();
+-- Fix D: Blocking transaction. Find the ROOT blocker first. (Killing the sessions
+-- with wait_event_type = 'Lock' only hurts the victims, not the cause.)
+SELECT pid, state, now() - xact_start AS xact_age, left(query, 60) AS query
+FROM pg_stat_activity
+WHERE pid IN (SELECT unnest(pg_blocking_pids(pid)) FROM pg_stat_activity)
+  AND cardinality(pg_blocking_pids(pid)) = 0;
+-- then, once you know what it is:
+SELECT pg_terminate_backend(12345);   -- the root blocker's pid
 ```
 
 ---

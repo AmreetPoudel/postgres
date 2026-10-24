@@ -14,7 +14,7 @@ Application latency spikes from 20ms to 5000ms. Monitoring shows PgBouncer has m
 
 ## Why This Happens
 
-In transaction pooling mode, PgBouncer has `pool_size` server connections per database/user pair. If more clients arrive than pool_size, they queue. If the queue grows faster than transactions complete → latency explodes.
+In transaction pooling mode, PgBouncer opens up to `default_pool_size` server connections per database/user pair (a `pool_size=` on the database's line overrides it). If more clients arrive than pool_size, they queue. If the queue grows faster than transactions complete → latency explodes.
 
 ---
 
@@ -42,10 +42,10 @@ SHOW STATS;
 
 ## Fix Options
 
-**Immediate**: Increase pool_size temporarily:
+**Immediate**: Increase the pool temporarily (the setting is `default_pool_size`; there's no global `pool_size`):
 ```ini
-# pgbouncer.ini
-pool_size = 50       # was 20
+# pgbouncer.ini (was 20)
+default_pool_size = 50
 ```
 ```bash
 psql -h 127.0.0.1 -p 6432 -U pgbouncer pgbouncer -c "RELOAD;"
@@ -58,9 +58,11 @@ SELECT pid, now() - query_start AS duration, state, left(query,100)
 FROM pg_stat_activity WHERE state = 'active' ORDER BY duration DESC;
 ```
 
-**Set client_login_timeout** so queued clients fail fast instead of piling up:
+**Set `query_wait_timeout`** so queued clients fail fast instead of piling up (`client_login_timeout` only covers the login handshake):
 ```ini
-client_login_timeout = 10
+; seconds a client may wait for a server connection (default 120)
+query_wait_timeout = 10
+; cancel queries running longer than this (default 0 = off)
 query_timeout = 30
 ```
 
@@ -69,52 +71,64 @@ query_timeout = 30
 ## Lab Exercise
 
 ```bash
-# Requires PgBouncer installed and configured
-# If not installed: apt install pgbouncer
+# Requires PgBouncer installed (apt install pgbouncer). This lab runs a second,
+# throwaway instance on port 6433, so it can't disturb a real one.
 
-# Basic pgbouncer.ini for this lab
+# A role for PgBouncer to log in as. PgBouncer passes the password from its
+# auth_file on to PostgreSQL, so it has to be the real one.
+psql -U postgres -c "CREATE ROLE bouncer_lab LOGIN PASSWORD 'labpass';"
+
+# default_pool_size = 2 is tiny on purpose, to demonstrate queuing
 cat > /tmp/pgbouncer_lab.ini << 'EOF'
 [databases]
 labdb = host=127.0.0.1 port=5432 dbname=postgres
 
 [pgbouncer]
-listen_port    = 6432
-listen_addr    = 127.0.0.1
-auth_type      = md5
-auth_file      = /tmp/pgbouncer_users.txt
-pool_mode      = transaction
-pool_size      = 2              # tiny on purpose to demonstrate queuing
-max_client_conn= 100
-admin_users    = pgbouncer
+listen_port       = 6433
+listen_addr       = 127.0.0.1
+auth_type         = scram-sha-256
+auth_file         = /tmp/pgbouncer_users.txt
+pool_mode         = transaction
+default_pool_size = 2
+max_client_conn   = 100
+admin_users       = pgadmin
+logfile           = /tmp/pgbouncer_lab.log
+pidfile           = /tmp/pgbouncer_lab.pid
 EOF
 
-echo '"pgbouncer" "pgbouncer"' > /tmp/pgbouncer_users.txt
+cat > /tmp/pgbouncer_users.txt << 'EOF'
+"bouncer_lab" "labpass"
+"pgadmin" "adminpass"
+EOF
 
+# PgBouncer refuses to run as root: start it as your normal user (or postgres)
 pgbouncer -d /tmp/pgbouncer_lab.ini
 ```
 
 ```bash
 # Simulate overload: 10 concurrent clients through a pool of 2
+export PGPASSWORD=labpass
 for i in $(seq 1 10); do
-    psql -h 127.0.0.1 -p 6432 -U postgres labdb \
+    psql -h 127.0.0.1 -p 6433 -U bouncer_lab labdb \
         -c "SELECT pg_sleep(2); SELECT $i AS id;" &
 done
 
 # Immediately check queue buildup
 sleep 1
-psql -h 127.0.0.1 -p 6432 -U pgbouncer pgbouncer -c "SHOW POOLS;"
+PGPASSWORD=adminpass psql -h 127.0.0.1 -p 6433 -U pgadmin pgbouncer -c "SHOW POOLS;"
 # cl_waiting should be > 0
 
 wait
 ```
 
 ```bash
-# Increase pool_size and compare
-# Edit ini: pool_size = 10
-# Reload and repeat
+# Increase the pool and compare: set default_pool_size = 10 in the ini, then
+PGPASSWORD=adminpass psql -h 127.0.0.1 -p 6433 -U pgadmin pgbouncer -c "RELOAD;"
+# ...and repeat the loop
 
-# Clean up
-pkill pgbouncer
+# Clean up: stop only this instance (never a blanket pkill pgbouncer)
+kill "$(cat /tmp/pgbouncer_lab.pid)"
+psql -U postgres -c "DROP ROLE bouncer_lab;"
 ```
 
 **Write down**: With pool_size=2, max cl_waiting seen: ___  

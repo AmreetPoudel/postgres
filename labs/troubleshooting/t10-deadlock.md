@@ -14,7 +14,7 @@ DETAIL: Process A waits for ShareLock; blocked by process B.
         Process B waits for ShareLock; blocked by process A.
 ```
 
-One transaction is killed. App retries and succeeds. But if it happens constantly, it degrades throughput.
+One transaction is aborted. App retries and succeeds. But if it happens constantly, it degrades throughput.
 
 ---
 
@@ -82,7 +82,8 @@ UPDATE dl_test SET val='T2-row1' WHERE id=1;   -- BLOCKS on T1
 ```sql
 -- Terminal 1: try to lock row 2 (T2 holds it)
 UPDATE dl_test SET val='T1-row2' WHERE id=2;
--- DEADLOCK — one session gets killed
+-- DEADLOCK — after deadlock_timeout (1s) one transaction is aborted.
+-- That session stays connected; only its transaction is rolled back.
 ```
 
 ```sql
@@ -90,9 +91,9 @@ UPDATE dl_test SET val='T1-row2' WHERE id=2;
 SELECT datname, deadlocks FROM pg_stat_database WHERE datname=current_database();
 
 -- Clean up
-ROLLBACK;   -- in whichever terminal survived
+ROLLBACK;   -- in BOTH terminals (the aborted one must roll back before it can do anything else)
 DROP TABLE dl_test;
 ```
 
-**Write down**: Which terminal was killed? ___  
+**Write down**: Which terminal's transaction was aborted? ___  
 What is the fix in application code? ___

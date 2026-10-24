@@ -46,20 +46,24 @@ WHERE wait_event_type = 'Lock'
 ORDER BY duration DESC;
 
 -- 2. Find the full blocking chain
+-- Who is blocking whom? pg_blocking_pids() understands every lock type,
+-- including the table locks behind a DDL pile-up
 SELECT
-    blocked.pid              AS blocked_pid,
-    blocked_act.query        AS blocked_query,
-    blocker.pid              AS blocker_pid,
-    blocker_act.query        AS blocker_query,
-    blocker_act.state        AS blocker_state,
-    now() - blocker_act.xact_start AS blocker_age
-FROM pg_locks blocked
-JOIN pg_locks blocker
-    ON  blocker.granted    = true
-    AND blocked.granted    = false
-    AND blocked.transactionid = blocker.transactionid
-JOIN pg_stat_activity blocked_act ON blocked_act.pid = blocked.pid
-JOIN pg_stat_activity blocker_act ON blocker_act.pid = blocker.pid;
+    blocked.pid                  AS blocked_pid,
+    left(blocked.query, 60)      AS blocked_query,
+    blocking.pid                 AS blocking_pid,
+    blocking.state               AS blocking_state,
+    now() - blocking.xact_start  AS blocker_age,
+    left(blocking.query, 60)     AS blocking_query
+FROM pg_stat_activity blocked
+CROSS JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid)
+JOIN pg_stat_activity blocking ON blocking.pid = b.pid;
+
+-- The root blockers: they block others but aren't waiting themselves
+SELECT pid, state, now() - xact_start AS xact_age, left(query, 60) AS query
+FROM pg_stat_activity
+WHERE pid IN (SELECT unnest(pg_blocking_pids(pid)) FROM pg_stat_activity)
+  AND cardinality(pg_blocking_pids(pid)) = 0;
 
 -- 3. Oldest open transaction (root of all problems)
 SELECT pid, usename, state,
@@ -75,8 +79,9 @@ ORDER BY xact_age DESC LIMIT 5;
 ## Immediate Fix
 
 ```sql
--- Kill the root blocker (the idle-in-transaction session)
-SELECT pg_terminate_backend(BLOCKER_PID);
+-- Kill the root blocker (the idle-in-transaction session; 12345 = its pid
+-- from the root-blocker query above)
+SELECT pg_terminate_backend(12345);
 -- All queued sessions immediately unblock
 ```
 
@@ -87,7 +92,8 @@ SELECT pg_terminate_backend(BLOCKER_PID);
 ```
 # postgresql.conf
 idle_in_transaction_session_timeout = 5min
-lock_timeout = 5s                           -- DDL fails fast instead of blocking
+lock_timeout = 5s                           # DDL fails fast instead of blocking (applies to
+                                            # every statement: many teams set it per role instead)
 statement_timeout = 30min
 ```
 
@@ -118,16 +124,21 @@ SET lock_timeout = '0';
 ALTER TABLE lock_lab ADD COLUMN extra text;
 -- Observe: this hangs
 
--- Terminal 3: diagnose while hanging
-SELECT pid, wait_event_type, wait_event, state, left(query,60)
+-- Terminal 3: an ordinary read, which now queues behind the ALTER
+SELECT * FROM lock_lab;
+-- Observe: this hangs too, although Terminal 1's identical read went straight through
+
+-- Terminal 4: diagnose while hanging
+SELECT pid, pg_blocking_pids(pid) AS blocked_by, wait_event_type, wait_event,
+       state, left(query, 60) AS query
 FROM pg_stat_activity
-WHERE wait_event_type = 'Lock' OR state = 'idle in transaction'
-ORDER BY (now() - query_start) DESC;
+WHERE cardinality(pg_blocking_pids(pid)) > 0 OR state = 'idle in transaction';
+-- Terminal 3 is blocked by Terminal 2, Terminal 2 by Terminal 1: Terminal 1 is the root
 
--- Find the blocker PID and kill it
-SELECT pg_terminate_backend(PID_OF_TERMINAL_1);
+-- Kill the root blocker (Terminal 1's pid from the output above)
+SELECT pg_terminate_backend(12345);
 
--- Terminal 2 should now either succeed or fail (ALTER on live table)
+-- Terminal 2's ALTER now succeeds, then Terminal 3's SELECT returns
 -- Terminal 1 gets: FATAL: terminating connection due to administrator command
 
 -- Cleanup

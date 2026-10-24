@@ -10,7 +10,11 @@
 
 After editing pg_hba.conf and reloading, all application connections fail:
 ```
-FATAL: pg_hba.conf rejects connection for host "10.0.0.5", user "appuser", database "mydb"
+FATAL: pg_hba.conf rejects connection for host "10.0.0.5", user "appuser", database "mydb", no encryption
+```
+or, when no rule matches at all:
+```
+FATAL: no pg_hba.conf entry for host "10.0.0.5", user "appuser", database "mydb", no encryption
 ```
 
 ---
@@ -20,7 +24,7 @@ FATAL: pg_hba.conf rejects connection for host "10.0.0.5", user "appuser", datab
 pg_hba.conf is processed top-to-bottom, first match wins. Common mistakes:
 - Added new rule at the bottom below a `reject all` line
 - Deleted the line that allowed your app's IP range
-- Changed `md5` to `scram-sha-256` but client doesn't support it
+- Changed `md5` to `scram-sha-256` while some users still have md5-hashed passwords (or a very old client library can't do SCRAM)
 - Typo in IP address
 
 ---
@@ -28,16 +32,20 @@ pg_hba.conf is processed top-to-bottom, first match wins. Common mistakes:
 ## Diagnosis
 
 ```bash
-# Check current pg_hba.conf
-cat "$PGDATA/pg_hba.conf"
+# Which file is in use? (if you can still connect at all)
+psql -U postgres -tAc "SHOW hba_file;"
+cat /etc/postgresql/16/main/pg_hba.conf    # Debian/Ubuntu
+cat "$PGDATA/pg_hba.conf"                  # RHEL and source installs
 
-# Test: can superuser still connect locally?
-psql -U postgres -h /var/run/postgresql   # local socket — unaffected by network rules
+# Can the superuser still connect over the Unix socket? That depends on your
+# "local" lines: they're rules too (the lab below breaks them as well)
+psql -U postgres -h /var/run/postgresql
 ```
 
 ```sql
--- See the loaded hba rules (PG10+)
-SELECT line_number, type, database, user_name, address, auth_method
+-- The rules as the file reads RIGHT NOW: parsed fresh, not necessarily what the
+-- server has loaded. That makes this view a way to test changes before a reload.
+SELECT line_number, type, database, user_name, address, auth_method, error
 FROM pg_hba_file_rules ORDER BY line_number;
 ```
 
@@ -49,11 +57,12 @@ FROM pg_hba_file_rules ORDER BY line_number;
 # Edit pg_hba.conf to fix the rule
 vim "$PGDATA/pg_hba.conf"
 
-# Test the new config BEFORE reloading
-pg_ctl reload -D "$PGDATA"
+# Test the new file BEFORE reloading: any row here means a broken line
+psql -c "SELECT line_number, error FROM pg_hba_file_rules WHERE error IS NOT NULL;"
 
-# Verify in pg_hba_file_rules again:
-psql -c "SELECT * FROM pg_hba_file_rules;"
+# Then reload. pg_ctl reload just sends a signal, so it works even when nobody
+# can log in (Debian/Ubuntu: pg_ctlcluster 16 main reload)
+pg_ctl reload -D "$PGDATA"
 ```
 
 ---
@@ -61,8 +70,9 @@ psql -c "SELECT * FROM pg_hba_file_rules;"
 ## Lab Exercise
 
 ```bash
-# Back up current pg_hba.conf
-cp "$PGDATA/pg_hba.conf" /tmp/pg_hba.conf.backup
+# Find and back up the current pg_hba.conf (do this BEFORE breaking anything)
+HBA=$(psql -U postgres -tAc "SHOW hba_file;")
+cp "$HBA" /tmp/pg_hba.conf.backup
 ```
 
 ```sql
@@ -79,9 +89,9 @@ local   all   all                reject
 host    all   all   0.0.0.0/0   reject
 EOF
 
-cat /tmp/bad_hba.conf "$PGDATA/pg_hba.conf" > /tmp/combined.conf
-cp /tmp/combined.conf "$PGDATA/pg_hba.conf"
-pg_ctl reload -D "$PGDATA"
+cat /tmp/bad_hba.conf "$HBA" > /tmp/combined.conf
+cp /tmp/combined.conf "$HBA"
+pg_ctl reload -D "$PGDATA"      # Debian/Ubuntu: pg_ctlcluster 16 main reload
 ```
 
 ```bash
@@ -90,8 +100,8 @@ psql -U postgres -h 127.0.0.1 -d postgres -c "SELECT 1;" 2>&1
 # FATAL: pg_hba.conf rejects connection...
 
 # Fix: restore from backup
-cp /tmp/pg_hba.conf.backup "$PGDATA/pg_hba.conf"
-pg_ctl reload -D "$PGDATA"
+cp /tmp/pg_hba.conf.backup "$HBA"
+pg_ctl reload -D "$PGDATA"      # works without any database connection
 
 # Verify recovery
 psql -U postgres -h 127.0.0.1 -d postgres -c "SELECT 1;"

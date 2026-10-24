@@ -21,24 +21,31 @@ You need to restore the data as of 14:31:59, 6 seconds before the accident.
 ## Diagnosis Before Restore
 
 ```sql
--- Find the exact time of the accidental operation from logs
--- grep "DELETE FROM orders" $PGDATA/log/postgresql-*.log
+-- Find the exact time of the accidental operation from the logs, if statements
+-- or slow queries are logged:
+--   grep "DELETE FROM orders" $PGDATA/log/postgresql-*.log
 
--- Or find the WAL LSN at accident time
-SELECT pg_current_wal_lsn();   -- note current LSN
--- In logs: look for "duration:" entry corresponding to the DELETE
+-- More precise: find the transaction itself in the WAL, then stop just before it.
+-- pg_waldump (a command-line tool) prints each record with its XID and LSN; look
+-- for the DELETE's commit record around 14:32:05:
+--   pg_waldump -p $PGDATA/pg_wal --start=<an LSN from before the accident> | grep COMMIT
+-- then recover with recovery_target_xid = '<that xid>' and
+-- recovery_target_inclusive = off (pgBackRest: --type=xid --target-exclusive)
 ```
 
 ---
 
-## Option A: PITR with pgBackRest (Production Standard)
+## Option A: In-Place PITR with pgBackRest
+
+**Warning:** an in-place PITR rewinds the *whole* cluster. Everything committed after 14:31:59, every legitimate order since the accident, is lost too. Prefer Option B unless the cluster is useless without an immediate rewind.
 
 ```bash
 # 1. Stop the running cluster
 pg_ctl stop -D /var/lib/postgresql/16/main -m fast
 
-# 2. Move current data directory aside
+# 2. Move current data directory aside, and create an empty one
 mv /var/lib/postgresql/16/main /var/lib/postgresql/16/main.broken
+install -d -o postgres -g postgres -m 700 /var/lib/postgresql/16/main
 
 # 3. Restore from backup to a point BEFORE the accident
 # Replace timestamp with 1 minute before the accident:
@@ -61,13 +68,22 @@ psql -c "SELECT count(*) FROM orders WHERE status='completed';"
 ## Option B: Restore to Separate Server (Safer)
 
 ```bash
-# Restore to separate server (leaves production untouched)
-# Then extract just the deleted data:
-pg_dump -t orders -f /tmp/recovered_orders.sql recovery-server
+# 1. PITR-restore the backup onto a separate server, to just before the accident
+#    (the same restore command as Option A, run there, plus --archive-mode=off)
 
-# Import into production:
-psql -d production_db -f /tmp/recovered_orders.sql
+# 2. On the recovery server, keep only the rows that were deleted:
+psql -h recovery-server -d mydb -c "CREATE TABLE orders_recovered AS
+    SELECT * FROM orders WHERE status = 'completed';"
+
+# 3. Copy that table to production, as a separate table:
+pg_dump -h recovery-server -d mydb -t orders_recovered | psql -h production -d mydb
+
+# 4. Put the rows back without touching anything written since the accident:
+psql -h production -d mydb -c "INSERT INTO orders SELECT * FROM orders_recovered
+    ON CONFLICT (id) DO NOTHING;"
 ```
+
+Restoring the whole `orders` table instead would collide with the rows that were never deleted, and would throw away everything written since the accident.
 
 ---
 

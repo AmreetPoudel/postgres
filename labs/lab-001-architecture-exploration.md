@@ -25,6 +25,22 @@ export PGDATA=$(psql -U postgres -tAc "SHOW data_directory;")
 echo $PGDATA
 ```
 
+On Debian/Ubuntu, `pg_ctl` isn't on your PATH and the config files live in `/etc/postgresql/16/main/`. Use `pg_ctlcluster 16 main status` (or `systemctl`), and ask PostgreSQL where things are:
+```bash
+psql -U postgres -c "SHOW config_file;" -c "SHOW hba_file;" -c "SHOW log_directory;"
+```
+
+Create the database and table the tasks below use:
+```bash
+psql -U postgres -c "CREATE DATABASE mydb;"
+psql -U postgres -d mydb -c "CREATE TABLE orders (
+    id          bigserial PRIMARY KEY,
+    customer_id int,
+    status      text,
+    created_at  timestamptz DEFAULT now()
+);"
+```
+
 ---
 
 ## Task 1: The Process Model (Part 1 + 3 from reading)
@@ -44,14 +60,16 @@ The `--forest` flag shows parent-child relationships. You should see:
 ```
 PID     | Process Name           | What it does (from your reading)
 --------|------------------------|----------------------------------
-        | postmaster             | 
-        | bgwriter               |
+        | postmaster             |
         | checkpointer           |
+        | background writer      |
         | walwriter              |
         | autovacuum launcher    |
-        | stats collector        |
+        | logical replication launcher |
         | your psql session      |
 ```
+
+There's no `stats collector` any more: PostgreSQL 15 moved statistics into shared memory. If an older guide tells you to find it, that's why you can't.
 
 **Challenge**: Open a second terminal and connect with psql. Then re-run `ps aux`. What new process appears? What's its PID? What does that prove?
 
@@ -71,11 +89,17 @@ FROM pg_settings
 WHERE name IN ('shared_buffers', 'work_mem', 'maintenance_work_mem', 'wal_buffers');
 ```
 
-On Linux, see the actual shared memory segment:
+How big is the shared memory PostgreSQL actually allocated? PG15+ reports it directly:
+```sql
+SHOW shared_memory_size;                 -- shared_buffers plus WAL buffers, lock table, etc.
+SHOW shared_memory_size_in_huge_pages;   -- how many huge pages that would need (Phase 2.7)
+```
+
+On Linux, look at the real mapping. Since PostgreSQL 9.3 the big segment is an anonymous `mmap`, so `ipcs -m` only shows a tiny System V segment of a few bytes. Look at the postmaster's memory map instead:
 ```bash
-ipcs -m | head -5
-# SHMID = shared memory ID
-# SHMEM size should reflect shared_buffers
+PM=$(head -1 "$PGDATA/postmaster.pid")       # first line = the postmaster's PID
+grep -E 'zero|hugepage' /proc/$PM/maps        # the shared memory mapping(s)
+pmap -x $PM | sort -k2 -n | tail -3           # the largest mapping ≈ shared_memory_size
 ```
 
 **Key question**: shared_buffers shows 128MB by default. That feels small. Why? And where does the rest of PostgreSQL's memory go? (Hint: look at work_mem — and think about 200 sessions each doing a sort...)
@@ -89,7 +113,7 @@ ipcs -m | head -5
 
 ## Task 3: PGDATA — The Filesystem Layout (Part 4 from reading)
 
-**What you're proving**: Tables are files named by OID. Databases are directories.
+**What you're proving**: Databases are directories named by OID. Tables are files named by relfilenode (which starts out equal to the table's OID).
 
 ```bash
 # List the base/ directory
@@ -99,7 +123,7 @@ ls -la $PGDATA/base/
 psql -U postgres -c "SELECT oid, datname FROM pg_database ORDER BY oid;"
 ```
 
-**Do the OIDs match the directory names?** They should. Write it down:
+**Do the OIDs match the directory names?** They should. (On PostgreSQL 15+, template1, template0 and postgres are always 1, 4 and 5.) Write it down:
 ```
 OID   | Directory in base/  | Database name
 ------|---------------------|---------------
@@ -127,10 +151,13 @@ WHERE relname = 'orders';   -- change to any table you have
 DB_OID=$(psql -U postgres -tAc "SELECT oid FROM pg_database WHERE datname='mydb';")
 # Use the relfilenode from above
 ls -lh $PGDATA/base/$DB_OID/<relfilenode>
+# or let PostgreSQL build the path:
+psql -U postgres -d mydb -tAc "SELECT pg_relation_filepath('orders');"
 
-# You'll also see two companion files:
+# After the table's first VACUUM you'll also see two companion files
+# (a brand-new table may not have them yet):
 # <relfilenode>_fsm   = free space map (where free space is in this file)
-# <relfilenode>_vm    = visibility map (which pages have only live tuples)
+# <relfilenode>_vm    = visibility map (which pages are all-visible / all-frozen)
 ```
 
 **If you insert a large number of rows, what do you expect to happen to the file size?**
@@ -164,17 +191,18 @@ Now watch WAL advance in real time:
 -- See current WAL position (LSN = Log Sequence Number)
 SELECT pg_current_wal_lsn(), pg_walfile_name(pg_current_wal_lsn());
 
--- Save this LSN
+-- Save it in a psql variable
+SELECT pg_current_wal_lsn() AS start_lsn \gset
+
 -- Now do a bunch of writes:
-INSERT INTO orders (customer_id, status) 
+INSERT INTO orders (customer_id, status)
 SELECT generate_series(1,50000), 'pending';
 
 -- Check WAL position again
 SELECT pg_current_wal_lsn(), pg_walfile_name(pg_current_wal_lsn());
 
 -- How much WAL was generated by those inserts?
-SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '<paste your first LSN here>');
--- Result is in bytes
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'start_lsn')) AS wal_generated;
 ```
 
 **What does this tell you about the write amplification of a large INSERT?**
@@ -214,7 +242,7 @@ SELECT n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE relname = 'mvcc_tes
 
 ```bash
 # Check the file size — it hasn't shrunk
-psql -c "SELECT pg_size_pretty(pg_relation_size('mvcc_test'));"
+psql -d mydb -c "SELECT pg_size_pretty(pg_relation_size('mvcc_test'));"
 ```
 
 Now run VACUUM manually and check again:
@@ -238,7 +266,8 @@ SELECT pg_size_pretty(pg_relation_size('mvcc_test'));
 
 ```sql
 -- Create a table with intentionally skewed data
-CREATE TABLE query_test (id serial, category text, value int);
+CREATE TABLE query_test (id serial, category text, value int)
+    WITH (autovacuum_enabled = false);   -- keep autoanalyze from quietly fixing the stats
 
 INSERT INTO query_test (category, value)
 SELECT 
@@ -278,7 +307,7 @@ EXPLAIN (ANALYZE, BUFFERS)
 SELECT * FROM query_test WHERE category = 'rare';
 ```
 
-**What plan does the planner pick now? Is it optimal? This is exactly how queries go from fast to slow in production.**
+**Compare the estimated rows with the actual rows. Then run `ANALYZE query_test;` and EXPLAIN again: which plan does it pick with correct statistics?** On a small, fully cached table both plans may still run quickly. The lesson is the estimate: every node above a wrong estimate is planned for the wrong number of rows. This is exactly how queries go from fast to slow in production.
 
 ---
 

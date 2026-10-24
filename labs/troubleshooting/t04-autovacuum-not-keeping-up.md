@@ -15,8 +15,8 @@ Table queries get slower over weeks. `n_dead_tup` grows continuously. `last_auto
 ## Why This Happens
 
 1. **Scale factor too large** — default 20% means 10M dead tuples on a 50M-row table before vacuum triggers
-2. **Long transactions blocking vacuum** — vacuum cannot clean tuples visible to old transactions
-3. **Cost throttle too aggressive** — vacuum sleeps 20ms between chunks on fast NVMe (crawling)
+2. **Something holding back the horizon** — long transactions, idle-in-transaction sessions that wrote something, replication slots, `hot_standby_feedback`, forgotten prepared transactions: vacuum can't remove tuples any of them might still need
+3. **Cost throttle too aggressive** — the default cost limit (200) caps a vacuum at a few MB/s of dirtied pages, a crawl on fast NVMe (the sleep was 20ms before PG12, 2ms now)
 4. **Not enough workers** — all 3 workers busy with other tables
 
 ---
@@ -36,15 +36,24 @@ ORDER BY n_dead_tup DESC LIMIT 10;
 SELECT pid, now() - query_start AS duration, query
 FROM pg_stat_activity WHERE backend_type = 'autovacuum worker';
 
--- Oldest transaction (blocking vacuum)
-SELECT pid, now() - xact_start AS age, state, left(query,80)
-FROM pg_stat_activity
-WHERE xact_start IS NOT NULL ORDER BY age DESC LIMIT 5;
+-- Everything that holds back the VACUUM horizon, oldest first
+SELECT 'session snapshot' AS holder, pid::text AS id, age(backend_xmin) AS xmin_age, state, left(query, 40) AS detail
+FROM pg_stat_activity WHERE backend_xmin IS NOT NULL
+UNION ALL
+SELECT 'session xid', pid::text, age(backend_xid), state, left(query, 40)
+FROM pg_stat_activity WHERE backend_xid IS NOT NULL
+UNION ALL
+SELECT 'replication slot', slot_name::text, greatest(age(xmin), age(catalog_xmin)), active::text, slot_type
+FROM pg_replication_slots WHERE xmin IS NOT NULL OR catalog_xmin IS NOT NULL
+UNION ALL
+SELECT 'prepared xact', gid, age(transaction), owner::text, database::text
+FROM pg_prepared_xacts
+ORDER BY xmin_age DESC;
 
 -- XID wraparound risk
 SELECT datname, age(datfrozenxid) AS xid_age
 FROM pg_database ORDER BY xid_age DESC;
--- Alert: > 500M. Emergency: > 1.5B
+-- Warn: > 500M. Critical: > 1B
 ```
 
 ---
@@ -89,6 +98,10 @@ log_autovacuum_min_duration     = 250
 ## Lab Exercise
 
 ```sql
+-- Log every autovacuum run first, so you can see when it fires
+ALTER SYSTEM SET log_autovacuum_min_duration = 0;
+SELECT pg_reload_conf();
+
 -- Create a bloat-prone table with default autovacuum
 CREATE TABLE bloat_watch (
     id      serial PRIMARY KEY,
@@ -108,10 +121,6 @@ SELECT 50 + (0.2 * 500000) AS trigger_threshold;  -- 100,050
 -- Monitor (check every 30 seconds for 5 minutes)
 SELECT relname, n_dead_tup, last_autovacuum
 FROM pg_stat_user_tables WHERE relname = 'bloat_watch';
-
--- Enable logging to confirm
-ALTER SYSTEM SET log_autovacuum_min_duration = 0;
-SELECT pg_reload_conf();
 
 -- Now switch to aggressive settings and compare speed
 ALTER TABLE bloat_watch SET (

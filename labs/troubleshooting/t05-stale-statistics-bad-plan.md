@@ -16,7 +16,9 @@ A query that ran in 50ms for months suddenly takes 30 seconds. Nothing changed i
 
 The planner uses `pg_statistic` row count estimates. If stats are stale, it picks the wrong plan.
 
-Classic: table grew from 1K to 50M rows after a data load. Statistics still say "100 rows match this filter". Planner picks index scan (good for 100 rows, terrible for 5M rows).
+Classic: a data load *changed the distribution*. A status that used to be rare is now most of the table, or new dates landed beyond the end of the histogram. Statistics still say "100 rows match this filter". Planner picks an index scan (good for 100 rows, terrible for 5M rows).
+
+Pure growth with the same distribution hurts less than you'd think: the planner scales its row estimates by the table's current size.
 
 ---
 
@@ -65,7 +67,7 @@ CREATE TABLE stale_stats_lab (
     id       serial PRIMARY KEY,
     category text,
     amount   numeric(10,2)
-);
+) WITH (autovacuum_enabled = false);   -- so autoanalyze can't fix the stats mid-lab
 CREATE INDEX ON stale_stats_lab(category);
 
 -- Small initial load
@@ -81,15 +83,23 @@ EXPLAIN (ANALYZE) SELECT * FROM stale_stats_lab WHERE category = 'cat_0';
 ```
 
 ```sql
--- Massive data load without ANALYZE
+-- First, growth alone: a big load with the SAME distribution, no ANALYZE
 INSERT INTO stale_stats_lab (category, amount)
 SELECT 'cat_' || (i%5), (random()*100)::numeric(10,2)
 FROM generate_series(1, 1000000) i;
 
--- Check plan with stale stats
 EXPLAIN (ANALYZE) SELECT * FROM stale_stats_lab WHERE category = 'cat_0';
 -- Estimated rows: ___  Actual rows: ___
--- Is the plan still correct?
+-- Surprisingly close: the planner scales the old statistics by the table's current size
+
+-- Now change the distribution: a category the statistics have never seen
+INSERT INTO stale_stats_lab (category, amount)
+SELECT 'cat_new', (random()*100)::numeric(10,2)
+FROM generate_series(1, 500000) i;
+
+EXPLAIN (ANALYZE) SELECT * FROM stale_stats_lab WHERE category = 'cat_new';
+-- Estimated rows: ___  Actual rows: ___
+-- Which plan did it pick for half a million rows?
 ```
 
 ```sql
@@ -97,8 +107,8 @@ EXPLAIN (ANALYZE) SELECT * FROM stale_stats_lab WHERE category = 'cat_0';
 ANALYZE stale_stats_lab;
 
 -- Check plan again
-EXPLAIN (ANALYZE) SELECT * FROM stale_stats_lab WHERE category = 'cat_0';
--- Estimated rows should now be close to actual
+EXPLAIN (ANALYZE) SELECT * FROM stale_stats_lab WHERE category = 'cat_new';
+-- Estimated rows should now be close to actual, and the plan should change
 
 DROP TABLE stale_stats_lab;
 ```

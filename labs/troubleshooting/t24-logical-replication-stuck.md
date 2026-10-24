@@ -15,7 +15,7 @@ Logical replication lag is growing. `pg_stat_subscription` shows the worker is n
 ## Why This Happens
 
 1. **Conflict on subscriber**: unique key violation or NOT NULL violation on an INSERT being replicated
-2. **Worker crashed**: replica identity missing (no primary key), can't apply UPDATE/DELETE
+2. **Missing replica identity**: a published table with no primary key and no `REPLICA IDENTITY`. The *publisher* then rejects UPDATE and DELETE on it (`cannot update table ... because it does not have a replica identity and publishes updates`): the application gets the error, not the subscriber
 3. **Table schema mismatch**: publisher has a column the subscriber doesn't
 4. **Subscriber disk full**: can't write WAL
 5. **Slot retained too much WAL**: publisher's disk is filling
@@ -42,7 +42,7 @@ FROM pg_replication_slots WHERE slot_type = 'logical';
 
 ```bash
 # Check subscriber logs for the error
-grep "ERROR\|FATAL" "$PGDATA/log/postgresql-*.log" | grep -i "subscription\|replica" | tail -20
+grep "ERROR\|FATAL" "$PGDATA"/log/postgresql-*.log | grep -i "subscription\|replica" | tail -20
 ```
 
 ---
@@ -68,6 +68,13 @@ SELECT pid, received_lsn FROM pg_stat_subscription;
 DELETE FROM local_table WHERE id = 42;   -- or UPDATE to resolve conflict
 
 -- Then the subscription will resume automatically
+
+-- PG15+: or skip the failing remote transaction entirely (its changes are lost).
+-- Take the LSN from "... finished at <LSN>" in the subscriber's error log:
+ALTER SUBSCRIPTION my_sub SKIP (lsn = '0/14C0378');
+
+-- PG15+: stop retrying in a loop after an error, and wait for you instead
+ALTER SUBSCRIPTION my_sub SET (disable_on_error = true);
 ```
 
 ---
@@ -75,11 +82,15 @@ DELETE FROM local_table WHERE id = 42;   -- or UPDATE to resolve conflict
 ## Fix: Missing Replica Identity
 
 ```sql
--- On PUBLISHER: find tables without primary key
-SELECT relname FROM pg_class
-WHERE relkind = 'r'
-  AND relreplident = 'n'    -- 'n' = nothing (can't replicate UPDATE/DELETE)
-  AND relname IN (SELECT tablename FROM pg_publication_tables WHERE pubname = 'my_pub');
+-- On PUBLISHER: published tables with no usable replica identity. 'n' = nothing;
+-- 'd' (default) only works if the table has a primary key
+SELECT pt.schemaname, pt.tablename, c.relreplident
+FROM pg_publication_tables pt
+JOIN pg_class c ON c.oid = format('%I.%I', pt.schemaname, pt.tablename)::regclass
+WHERE pt.pubname = 'my_pub'
+  AND (c.relreplident = 'n'
+       OR (c.relreplident = 'd'
+           AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary)));
 
 -- Fix: add replica identity
 ALTER TABLE problem_table REPLICA IDENTITY FULL;
@@ -92,6 +103,10 @@ ALTER TABLE problem_table ADD PRIMARY KEY (id);
 ## Lab Exercise
 
 ```sql
+-- Prerequisite: wal_level = logical, which needs a restart:
+--   ALTER SYSTEM SET wal_level = logical;   -- then restart PostgreSQL
+SHOW wal_level;   -- must say logical
+
 -- Setup: simple logical replication (publisher and subscriber in same cluster, different DBs)
 CREATE DATABASE pub_db;
 CREATE DATABASE sub_db;
@@ -106,12 +121,17 @@ CREATE PUBLICATION my_pub FOR TABLE pub_test;
 ```
 
 ```sql
+-- Still on pub_db: create the slot first. Within ONE cluster, CREATE SUBSCRIPTION
+-- hangs if it has to create the slot itself (a documented restriction).
+SELECT pg_create_logical_replication_slot('my_sub', 'pgoutput');
+
 -- On sub_db
 \c sub_db
 CREATE TABLE pub_test (id serial PRIMARY KEY, data text);
 CREATE SUBSCRIPTION my_sub
-    CONNECTION 'host=127.0.0.1 port=5432 dbname=pub_db user=postgres'
-    PUBLICATION my_pub;
+    CONNECTION 'host=127.0.0.1 port=5432 dbname=pub_db user=postgres'   -- add password=... if pg_hba.conf asks for one
+    PUBLICATION my_pub
+    WITH (create_slot = false);
 
 -- Check sync started
 SELECT subname, pid FROM pg_stat_subscription;
@@ -134,12 +154,16 @@ INSERT INTO pub_test (id, data) VALUES (100, 'from publisher');
 SELECT subname, pid FROM pg_stat_subscription;
 -- pid may be NULL (worker crashed)
 
--- Resolve conflict
+-- Watch the error count climb while the worker retries
+SELECT subname, apply_error_count FROM pg_stat_subscription_stats;
+
+-- Resolve conflict: remove the local row that's in the way
 \c sub_db
 DELETE FROM pub_test WHERE id = 100;
-ALTER SUBSCRIPTION my_sub DISABLE;
-ALTER SUBSCRIPTION my_sub ENABLE;
-SELECT subname, pid FROM pg_stat_subscription;  -- worker should be back
+-- No restart needed: the worker's next retry (within seconds) succeeds
+SELECT pg_sleep(10);
+SELECT * FROM pub_test WHERE id = 100;          -- now the publisher's row
+SELECT subname, pid FROM pg_stat_subscription;  -- worker running
 ```
 
 ```sql

@@ -13,13 +13,16 @@ etcd-node (10.0.0.30)  — etcd DCS
 
 Replace IPs with your actual values throughout.
 
+A single etcd node has no quorum to lose: fine for learning Patroni, never for production (5.3 explains why you need three or more, and 5.5 where to put them).
+
 ---
 
 ## Task 1: Install and Start etcd
 
 ```bash
-# On etcd-node (10.0.0.30)
-apt install -y etcd
+# On etcd-node (10.0.0.30). Debian 12 / Ubuntu 24.04 package names;
+# older releases: apt install -y etcd
+apt install -y etcd-server etcd-client
 
 cat > /etc/default/etcd << 'EOF'
 ETCD_NAME="etcd-node1"
@@ -45,12 +48,23 @@ etcdctl --endpoints=http://10.0.0.30:2379 endpoint health
 
 ```bash
 # On BOTH pg-node1 and pg-node2
-apt install -y python3-pip postgresql-16
-pip3 install patroni[etcd3]
+apt install -y postgresql-16 python3-venv
 
-# Stop and disable native PostgreSQL service — Patroni manages it
+# Patroni in a virtualenv (recent Debian/Ubuntu refuse a system-wide pip install).
+# Patroni doesn't bring a PostgreSQL driver by itself, so psycopg3 is named in the extras.
+python3 -m venv /opt/patroni
+/opt/patroni/bin/pip install 'patroni[psycopg3,etcd3]'
+ln -s /opt/patroni/bin/patroni /opt/patroni/bin/patronictl /usr/local/bin/
+# (Alternative: apt install patroni, from the PostgreSQL apt repository.)
+
+# Stop and disable the packaged PostgreSQL service — Patroni manages PostgreSQL now
 systemctl stop postgresql
 systemctl disable postgresql
+
+# Installing postgresql-16 also created a cluster in /var/lib/postgresql/16/main.
+# Remove it: pg-node1 must bootstrap a fresh cluster and pg-node2 must clone pg-node1
+# (an unrelated existing cluster makes Patroni stop with "system ID mismatch").
+pg_dropcluster --stop 16 main
 ```
 
 ---
@@ -95,16 +109,14 @@ bootstrap:
     - data-checksums
 
   pg_hba:
+    - local all all peer
+    - host all all 127.0.0.1/32 scram-sha-256
+    - host all all ::1/128 scram-sha-256
     - host replication replicator 10.0.0.0/24 scram-sha-256
-    - host all all 0.0.0.0/0 scram-sha-256
+    - host all all 10.0.0.0/24 scram-sha-256    # lab subnet only, never 0.0.0.0/0
 
-  users:
-    postgres:
-      password: pgpass123
-      options: [superuser, createdb]
-    replicator:
-      password: replpass123
-      options: [replication]
+  # No bootstrap.users section: Patroni 4 removed it. Patroni creates the
+  # superuser, replicator and rewind users from "authentication" below.
 
 postgresql:
   listen: 0.0.0.0:5432
@@ -129,6 +141,10 @@ tags:
   clonefrom: false
   nosync: false
 EOF
+
+# It contains passwords, and Patroni runs as postgres
+chown postgres: /etc/patroni/patroni.yml
+chmod 600 /etc/patroni/patroni.yml
 ```
 
 ```bash
@@ -172,7 +188,7 @@ journalctl -u patroni -f     # Watch until you see "promoted self to leader"
 
 # Then start pg-node2:
 systemctl start patroni
-journalctl -u patroni -f     # Watch until you see "replica connected"
+journalctl -u patroni -f     # Watch until you see "a secondary, and following a leader (pg-node1)"
 ```
 
 ---
@@ -212,17 +228,24 @@ curl http://10.0.0.20:8008/replica    # should return HTTP 200 on Replica
 ## Task 6: Automatic Failover Test
 
 ```bash
-# Simulate primary crash — kill PostgreSQL on pg-node1
-# On pg-node1:
-pg_ctl stop -D /var/lib/postgresql/16/main -m immediate
-
-# Watch failover on pg-node2 (or etcd-node):
+# First, prove what does NOT cause a failover. On pg-node1, stop only PostgreSQL:
+sudo -u postgres /usr/lib/postgresql/16/bin/pg_ctl stop -D /var/lib/postgresql/16/main -m immediate
+# Watch for ~20 seconds: Patroni still holds the leader lock, so it simply starts
+# PostgreSQL again. That's the right behavior: restart it, don't fail over.
 watch -n 1 "patronictl -c /etc/patroni/patroni.yml list"
 
-# Expected sequence:
-# t+0:  pg-node1 shows as stopped
-# t+30: pg-node2 acquires leader lease
-# t+32: pg-node2 promoted to Leader
+# Now simulate a crash of the whole node. Best: hard power-off the pg-node1 VM from
+# the hypervisor. Next best, on pg-node1: kill Patroni and all PostgreSQL processes
+# at once (both run as the postgres user):
+sudo pkill -9 -u postgres
+
+# Watch failover from pg-node2:
+watch -n 1 "patronictl -c /etc/patroni/patroni.yml list"
+
+# Expected sequence (ttl = 30):
+# t+0:            pg-node1 stops answering
+# by about t+30:  its leader key expires and pg-node2 acquires it
+# moments later:  pg-node2 promoted to Leader
 
 # Record the failover time: _____ seconds
 ```
@@ -235,7 +258,7 @@ psql -h 10.0.0.20 -U postgres -c "SELECT pg_is_in_recovery();"  -- must return f
 
 ```bash
 # Bring pg-node1 back — Patroni will pg_rewind and rejoin as Replica
-# On pg-node1:
+# On pg-node1 (if you powered the VM off, just boot it: the service starts by itself):
 systemctl start patroni
 sleep 30
 patronictl -c /etc/patroni/patroni.yml list
@@ -306,16 +329,17 @@ psql -h 10.0.0.10 -p 5001 -U postgres -c "SELECT pg_is_in_recovery();"  -- true
 ## Task 8: HAProxy Survives Failover
 
 ```bash
-# Kill the current Leader again
-# On current Leader:
-pg_ctl stop -D /var/lib/postgresql/16/main -m immediate
-
-# Meanwhile, send continuous writes through HAProxy port 5000 from client machine:
+# 1. From the client machine, start continuous writes through HAProxy port 5000:
 for i in $(seq 1 200); do
     psql -h 10.0.0.10 -p 5000 -U postgres \
         -c "INSERT INTO ha_test (msg) VALUES ('write $i');" 2>&1
     sleep 0.5
 done
+
+# 2. While that runs (from another terminal), crash the current Leader. It must not
+#    be the node running HAProxy (after Task 6 the Leader is pg-node2). Power it off,
+#    or on that node:
+sudo pkill -9 -u postgres
 
 # How many writes failed during failover? ___
 # How long was the outage window? ___

@@ -10,8 +10,9 @@
 
 Application logs flood with:
 ```
-FATAL: remaining connection slots are reserved for non-replication superuser connections
+FATAL: remaining connection slots are reserved for roles with the SUPERUSER attribute
 ```
+(That's the PostgreSQL 16 wording; 15 and older say "reserved for non-replication superuser connections".)
 or:
 ```
 FATAL: sorry, too many clients already
@@ -28,6 +29,7 @@ SHOW max_connections;
 -- e.g., 100
 -- PostgreSQL reserves superuser_reserved_connections (default 3) for admins.
 -- When all 97 regular slots are taken, new connections fail.
+-- PG16 can reserve more for roles granted pg_use_reserved_connections (reserved_connections).
 ```
 
 Common causes:
@@ -42,12 +44,14 @@ Common causes:
 ## Diagnosis
 
 ```sql
--- 1. How many connections right now?
-SELECT count(*) FROM pg_stat_activity;
+-- 1. How many client connections right now? (pg_stat_activity also lists
+--    background processes, which don't use max_connections slots)
+SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend';
 
 -- 2. What state are they in?
 SELECT state, count(*)
 FROM pg_stat_activity
+WHERE backend_type = 'client backend'
 GROUP BY state ORDER BY count(*) DESC;
 -- idle                → doing nothing (leak or pool misconfiguration)
 -- idle in transaction → in BEGIN but paused (dangerous)
@@ -71,7 +75,7 @@ GROUP BY client_addr ORDER BY count(*) DESC;
 
 ## Immediate Fix
 
-Superuser always gets in (that is what `superuser_reserved_connections` is for):
+A superuser can still get in through the `superuser_reserved_connections` slots, unless your application itself connects as a superuser and has used those up too (one more reason it shouldn't):
 
 ```bash
 psql -U postgres -d postgres
@@ -124,7 +128,8 @@ SELECT
     current_setting('max_connections')::int
         - current_setting('superuser_reserved_connections')::int
         - count(*)                                                        AS slots_remaining
-FROM pg_stat_activity;
+FROM pg_stat_activity
+WHERE backend_type = 'client backend';
 
 -- Set idle timeout and verify it applies
 ALTER SYSTEM SET idle_in_transaction_session_timeout = '5min';

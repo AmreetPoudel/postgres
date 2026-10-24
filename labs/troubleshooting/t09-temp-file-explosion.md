@@ -49,8 +49,15 @@ SET work_mem = '1GB';
 RESET work_mem;
 ```
 
+```
+# postgresql.conf: cap temp file space per process, so one runaway query
+# fails with an error instead of filling the disk
+temp_file_limit = 20GB
+```
+
 ```sql
--- Move temp files to a separate disk
+-- Move temp files to a separate disk (the directory must exist, be empty,
+-- and be owned by the postgres user)
 CREATE TABLESPACE scratch LOCATION '/mnt/scratch/pgsql_tmp';
 
 -- postgresql.conf
@@ -74,8 +81,9 @@ FROM generate_series(1, 3000000);
 SET work_mem = '1MB';
 
 EXPLAIN (ANALYZE, BUFFERS)
-SELECT k, v FROM sort_lab ORDER BY k LIMIT 100;
+SELECT k, v FROM sort_lab ORDER BY k;
 -- Look for: Sort Method: external merge Disk: xxxMB
+-- (Add LIMIT 100 and the spill disappears: a "top-N heapsort" only keeps 100 rows)
 
 -- Check temp stats
 SELECT datname, temp_files, pg_size_pretty(temp_bytes)
@@ -86,7 +94,7 @@ FROM pg_stat_database WHERE datname = current_database();
 -- Fix with adequate work_mem
 SET work_mem = '512MB';
 EXPLAIN (ANALYZE, BUFFERS)
-SELECT k, v FROM sort_lab ORDER BY k LIMIT 100;
+SELECT k, v FROM sort_lab ORDER BY k;
 -- Sort Method: quicksort Memory: xxxkB
 
 RESET work_mem;

@@ -92,19 +92,36 @@ UPDATE bloat_lab SET counter = counter + 1;
 SELECT pg_size_pretty(pg_relation_size('bloat_lab')) AS bloated_size;
 ```
 
-Now run VACUUM FULL. In a second psql terminal, try to SELECT from the table at the same time:
+Now run VACUUM FULL. On a table this size it finishes in about a second, too fast to race by hand, so make the lock visible with three terminals:
 
-**Terminal 1:**
+**Terminal 1 (hold a normal read lock, like a long report would):**
+```sql
+BEGIN;
+SELECT count(*) FROM bloat_lab;
+-- don't COMMIT yet
+```
+
+**Terminal 2:**
 ```sql
 VACUUM FULL VERBOSE bloat_lab;
+-- Waits: it needs ACCESS EXCLUSIVE, which conflicts with Terminal 1's ACCESS SHARE
 ```
 
-**Terminal 2 (immediately after starting Terminal 1):**
+**Terminal 3:**
 ```sql
 SELECT count(*) FROM bloat_lab;
--- This will BLOCK until VACUUM FULL finishes
--- This proves the ACCESS EXCLUSIVE lock
+-- Also waits, even though Terminal 1's identical query ran fine.
+-- It queues behind Terminal 2's pending ACCESS EXCLUSIVE request.
 ```
+
+**Terminal 4 (optional): see the queue**
+```sql
+SELECT pid, pg_blocking_pids(pid) AS blocked_by, wait_event_type, left(query, 40) AS query
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0;
+```
+
+Now `COMMIT;` in Terminal 1. Terminal 2's VACUUM FULL runs, and Terminal 3's SELECT completes right after it. That's the ACCESS EXCLUSIVE lock, plus the lock queue behind it: T-02 is this same pile-up in production.
 
 After VACUUM FULL completes:
 
@@ -200,7 +217,7 @@ LIMIT 10;
 
 Record: oldest database XID age = _____  |  % to wraparound = _____%
 
-Alert threshold: > 500 million. Emergency: > 1.5 billion.
+Alert threshold: > 500 million. Critical: > 1 billion (VACUUM's failsafe engages at 1.6 billion).
 
 ---
 

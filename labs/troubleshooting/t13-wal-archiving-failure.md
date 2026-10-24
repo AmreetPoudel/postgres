@@ -14,14 +14,14 @@ Alerts: "WAL archive failures > 10". Or worse — no alert, and you only discove
 
 ## Why This Happens
 
-`archive_command` runs as a shell command. It fails silently if:
+`archive_command` runs as a shell command. It fails, logging only a WARNING that nobody reads, if:
 - Archive destination is full
 - NFS mount dropped
 - SSH key expired
 - Wrong permissions on archive directory
 - The command itself has a bug
 
-PostgreSQL retries the archive command every `archive_timeout` seconds, keeps the WAL segment, and increments `failed_count` in `pg_stat_archiver`. But it doesn't stop the database.
+PostgreSQL keeps the WAL segment and retries: three quick attempts, then again about a minute later, forever, incrementing `failed_count` in `pg_stat_archiver` each time. (`archive_timeout` has nothing to do with retries.) It never stops the database — until `pg_wal/` fills the disk (T-03).
 
 ---
 
@@ -37,9 +37,9 @@ SELECT archived_count,
 FROM pg_stat_archiver;
 
 -- Red flags:
--- failed_count > 0
--- since_last_archive > 10 minutes
--- last_failed_wal is not null
+-- last_failed_time newer than last_archived_time → the latest attempt failed
+-- since_last_archive > 10 minutes on a busy server
+-- (failed_count only ever grows, so on its own it can't tell you "broken right now")
 ```
 
 ```bash
@@ -47,8 +47,9 @@ FROM pg_stat_archiver;
 archive_cmd=$(psql -t -c "SHOW archive_command;")
 echo "Command: $archive_cmd"
 
-# Find the oldest un-archived WAL
-ls -la "$PGDATA/pg_wal/" | head -20
+# Segments waiting to be archived have a .ready file; the oldest is next in line
+ls "$PGDATA/pg_wal/archive_status/"*.ready 2>/dev/null | head -5
+ls "$PGDATA/pg_wal/archive_status/"*.ready 2>/dev/null | wc -l
 ```
 
 ---
@@ -56,12 +57,15 @@ ls -la "$PGDATA/pg_wal/" | head -20
 ## Fix
 
 ```bash
-# 1. Fix the underlying issue (disk space, mount, permissions)
-# 2. Manually archive the failed file:
-cp "$PGDATA/pg_wal/FAILED_WAL_SEGMENT" /archive/location/
+# 1. Fix the underlying issue (disk space, mount, permissions, the command itself)
+# 2. Do NOT copy segments into the archive by hand. PostgreSQL retries on its own
+#    within about a minute, and a hand-copied file makes a "test ! -f" style
+#    archive_command refuse that segment forever. Just watch it catch up:
+psql -c "SELECT last_archived_wal, last_archived_time, last_failed_time FROM pg_stat_archiver;"
+ls "$PGDATA/pg_wal/archive_status/"*.ready 2>/dev/null | wc -l    # should drop to 0
 
-# 3. Reset the archiver stats:
-SELECT pg_stat_reset_shared('archiver');
+# 3. Optionally reset the counters so the next failure stands out:
+psql -c "SELECT pg_stat_reset_shared('archiver');"
 ```
 
 ---
@@ -70,17 +74,17 @@ SELECT pg_stat_reset_shared('archiver');
 
 ```
 # postgresql.conf
-archive_timeout = 300s          -- force WAL segment every 5 min even if idle
-                                 -- limits data loss and archive gaps
+archive_timeout = 300s          # switch segments after 5 min if any WAL was written,
+                                # bounding how much recent data a PITR could lose
 ```
 
 Always verify archiving works after setup:
 ```bash
-# Create a checkpoint to force WAL switch
+# Force a WAL segment switch (it does nothing if no WAL was written since the last one)
 psql -c "SELECT pg_switch_wal();"
 sleep 10
 psql -c "SELECT * FROM pg_stat_archiver;"
-# failed_count must be 0
+# last_archived_wal should now be the segment you just switched away from
 ```
 
 ---

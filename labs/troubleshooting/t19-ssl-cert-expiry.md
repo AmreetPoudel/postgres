@@ -21,13 +21,15 @@ FATAL: could not accept SSL connection: certificate verify failed
 
 ## Why This Happens
 
-`server.crt` (and/or client CA certificate) expired. PostgreSQL loads the certificate at startup. If it expires while running, new SSL connections fail.
+`server.crt` (and/or the CA certificate) expired. PostgreSQL loads the certificate at startup and at every reload. Once it has expired, clients that verify it (`sslmode=verify-ca` or `verify-full`) refuse to connect. Clients using `sslmode=require` don't check the certificate at all, so they keep working, which is why expiry often surprises only some of your applications.
 
 ---
 
 ## Diagnosis
 
 ```bash
+# Which file? psql -c "SHOW ssl_cert_file;"  A relative name like server.crt lives in
+# $PGDATA; Debian/Ubuntu default to /etc/ssl/certs/ssl-cert-snakeoil.pem
 # Check certificate expiry
 openssl x509 -in "$PGDATA/server.crt" -noout -dates
 # notAfter=Oct 14 00:00:00 2026 GMT  ← if this is in the past, you're expired
@@ -59,7 +61,7 @@ openssl req -new -x509 -days 365 -nodes \
 chmod 600 "$PGDATA/server.key"
 chown postgres:postgres "$PGDATA/server.key" "$PGDATA/server.crt"
 
-# Reload PostgreSQL (no restart needed for cert refresh in PG14+)
+# Reload PostgreSQL (no restart needed: certificates are reloaded on SIGHUP since PG10)
 pg_ctl reload -D "$PGDATA"
 ```
 

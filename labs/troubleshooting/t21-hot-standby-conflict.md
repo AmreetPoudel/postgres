@@ -36,7 +36,7 @@ FROM pg_stat_database_conflicts WHERE datname = current_database();
 
 ```bash
 # Logs on standby:
-grep "conflict with recovery" "$PGDATA/log/postgresql-*.log" | tail -10
+grep "conflict with recovery" "$PGDATA"/log/postgresql-*.log | tail -10   # Debian/Ubuntu: /var/log/postgresql/
 ```
 
 ---
@@ -56,9 +56,10 @@ hot_standby_feedback = on
 # WARNING: can cause bloat on primary if standby has very long queries
 ```
 
-**Option 3**: Use a delayed standby for long-running analytics (won't conflict):
+**Option 3**: A dedicated reporting standby that never cancels queries. Replay waits for them instead, so this standby falls behind while long reports run. (A *delayed* standby doesn't help: conflicts happen whenever the WAL gets applied, delayed or not.)
 ```
-recovery_min_apply_delay = '30min'   # standby always 30 min behind
+# postgresql.conf on the reporting STANDBY
+max_standby_streaming_delay = -1     # wait as long as it takes
 ```
 
 ---
@@ -77,15 +78,16 @@ SELECT confl_snapshot FROM pg_stat_database_conflicts
 WHERE datname = current_database();
 
 -- On STANDBY: run a long query
-SELECT pg_sleep(30);
--- (This holds a snapshot open)
+SELECT pg_sleep(120);
+-- (This holds a snapshot open for 2 minutes, longer than the default
+--  max_standby_streaming_delay of 30s)
 ```
 
 ```sql
 -- On PRIMARY: while standby is sleeping, trigger a VACUUM that conflicts
 CREATE TABLE conflict_test AS SELECT i, md5(i::text) FROM generate_series(1,100000) i;
 UPDATE conflict_test SET md5 = md5(i::text);  -- create dead tuples
-VACUUM conflict_test;   -- may create a conflict on standby
+VACUUM conflict_test;   -- removes rows the standby's snapshot may still need
 DROP TABLE conflict_test;
 ```
 
