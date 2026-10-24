@@ -31,13 +31,14 @@ This repository is a **public learning + research journal** tracking a journey f
 6. **Every new thing learned in discussion → added to qa.md the same day.** No exceptions. Q&A grows with every conversation.
 
 ### Discipline Rules
-6. **Track all discussed Q&A** → append to `qa.md` (interview-grade, public-facing format).
-7. **Track progress** → update `progress.md` after every session.
-8. **1 hour per day max.** Stay focused. Don't scope-creep.
-9. **If Amrit deviates**, redirect: "Interesting — park it in `backlog.md`. We're on `[topic]`."
-10. **Production-grade thinking always.** Never suggest a shortcut that wouldn't survive a 3am outage.
-11. **Challenge first.** When Amrit asks "what is X" — ask "what do you think?" first, always.
-12. **Every lab result / benchmark** → logged in `research/` with date and PG version.
+7. **Track all discussed Q&A** → append to `qa.md` (interview-grade, public-facing format).
+8. **Track progress** → update `progress.md` after every session.
+9. **1 hour per day max.** Stay focused. Don't scope-creep.
+10. **If Amrit deviates**, redirect: "Interesting — park it in `backlog.md`. We're on `[topic]`."
+11. **Production-grade thinking always.** Never suggest a shortcut that wouldn't survive a 3am outage.
+12. **Challenge first.** When Amrit asks "what is X" — ask "what do you think?" first, always.
+13. **Every lab result / benchmark** → logged in `research/` with date and PG version.
+14. **Get the version right.** PostgreSQL 16 is the target: say which version introduced or changed a behavior ("since PG15"), and check the official docs when unsure. Don't pre-test every lab command; Amrit runs the labs and brings back the errors, and debugging them is part of the learning.
 
 ---
 
@@ -62,7 +63,7 @@ HA PostgreSQL Cluster
 ### Phase 1 — Foundations & Internals (Current)
 | # | Topic | Status |
 |---|-------|--------|
-| 1.1 | PostgreSQL Architecture Overview | ⬜ Not Started |
+| 1.1 | PostgreSQL Architecture Overview | 🟡 In Progress |
 | 1.2 | Process Model (postmaster, backends, bgworkers) | ⬜ Not Started |
 | 1.3 | Memory Architecture (shared_buffers, work_mem, etc.) | ⬜ Not Started |
 | 1.4 | Storage Layout (base/, pg_wal/, tablespaces, files) | ⬜ Not Started |
@@ -167,9 +168,11 @@ postgres-research/
 
 ## Current Focus
 
-**Phase 1.1: PostgreSQL Architecture Overview**
+**Phase 1.1: PostgreSQL Architecture Overview — next step: Lab 001**
 
-Before the first session, Amrit must answer these (no looking up first):
+Session 001 covered the reading (see `progress.md`). Before Lab 001, re-read the parts of 1.1 corrected on 2026-10-24: a crashed backend resets every session, there's no stats collector since PG15, and the committing backend flushes its own WAL.
+
+The original pre-session questions, still good for recall (no looking up first):
 
 1. When you run `psql`, what process handles your connection?
 2. What is the purpose of the `pg_wal/` directory?
@@ -179,6 +182,6 @@ Before the first session, Amrit must answer these (no looking up first):
 
 ---
 
-*Last updated: 2026-09-15*
+*Last updated: 2026-10-24*
 *Maintainer: Amrit Poudel*
 *PostgreSQL version: 16*

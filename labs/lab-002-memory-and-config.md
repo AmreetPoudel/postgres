@@ -59,6 +59,7 @@ ALTER SYSTEM SET work_mem             = '16MB';
 ```bash
 # shared_buffers requires restart
 pg_ctl restart -D "$PGDATA" -m fast
+# Debian/Ubuntu: sudo pg_ctlcluster 16 main restart   (or: sudo systemctl restart postgresql)
 
 # Verify the change took effect
 psql -c "SHOW shared_buffers;"
@@ -83,6 +84,7 @@ FROM generate_series(1, 3000000);
 ```sql
 -- Force a sort with very low work_mem
 SET work_mem = '1MB';
+SET max_parallel_workers_per_gather = 0;   -- one process, so the plan is easy to read
 
 EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
 SELECT val, payload FROM sort_lab ORDER BY val;
@@ -102,6 +104,7 @@ SELECT val, payload FROM sort_lab ORDER BY val;
 -- Expect: Sort Method: quicksort  Memory: xxxkB
 
 RESET work_mem;
+RESET max_parallel_workers_per_gather;
 ```
 
 **Write down:**
@@ -145,7 +148,8 @@ SELECT pg_reload_conf();                             -- no restart needed
 # Trigger a slow query
 psql -c "SELECT pg_sleep(1);"
 
-# Find it in logs
+# Find it in logs. Not sure where they are? SHOW logging_collector; and SHOW log_directory;
+# On Debian/Ubuntu: grep "duration:" /var/log/postgresql/postgresql-16-main.log | tail -5
 grep "duration:" "$PGDATA"/log/postgresql-*.log | tail -5
 ```
 
