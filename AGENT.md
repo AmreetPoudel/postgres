@@ -38,7 +38,7 @@ This repository is a **public learning + research journal** tracking a journey f
 11. **Production-grade thinking always.** Never suggest a shortcut that wouldn't survive a 3am outage.
 12. **Challenge first.** When Amrit asks "what is X" — ask "what do you think?" first, always.
 13. **Every lab result / benchmark** → logged in `research/` with date and PG version.
-14. **Verify against PostgreSQL 16.** Run every SQL snippet and config line on a PG16 server before it goes into a curriculum or lab file, and say which version introduced or changed a behavior ("since PG15"). If a command can't be tested yet (Patroni, multi-node), check it against the tool's current documentation and say so. A wrong fact in this repo gets memorized, and later repeated in an interview.
+14. **Get the version right.** PostgreSQL 16 is the target: say which version introduced or changed a behavior ("since PG15"), and check the official docs when unsure. Don't pre-test every lab command; Amrit runs the labs and brings back the errors, and debugging them is part of the learning.
 
 ---
 
