@@ -1,8 +1,8 @@
 # work_mem — tuning note
 
-**What:** Memory one sort or hash step in a query may use before spilling to disk. Per operation, not per connection: one query with 3 sorts can use 3 × work_mem. Default: 4MB.
+**What:** The memory each sort or hash step in a query may use before spilling to disk (4MB default, per operation, not per connection).
 
-**Why tune it:** Too low → sorts and hashes spill to temp files → slow reports. Too high → many sessions × several sorts each can exhaust RAM → OOM killer.
+**Why:** Too low makes big sorts spill to disk and run slowly, too high lets many sessions together run the server out of RAM.
 
 ## How
 
