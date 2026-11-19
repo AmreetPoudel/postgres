@@ -7,7 +7,7 @@
 
 | Date | Item | Context | Phase to Revisit |
 |------|------|---------|-----------------|
-| — | — | — | — |
+| 2026-11-19 | Build a PostgreSQL configuration tuning script | After the course: use CPU, RAM, storage and workload/concurrency to calculate starting values; back up config, review changes, write approved values, and distinguish reload from restart. See notes/work_mem.md. | End of course |
 
 ---
 
